@@ -1,14 +1,12 @@
 # Setup:
 # virtualenv -p /usr/bin/python3 env
 # source env/bin/activate
-# pip install requests beautifulsoup4 lxml
+# pip install -r requirements.txt
 # python self-test.py --help
 
 import argparse
 from collections import defaultdict
 import json
-from pdb import set_trace
-import os
 import sys
 
 from bs4 import BeautifulSoup
