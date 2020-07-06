@@ -7,8 +7,6 @@
 import argparse
 from collections import defaultdict
 import json
-from pdb import set_trace
-import os
 import sys
 
 from bs4 import BeautifulSoup
