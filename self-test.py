@@ -53,6 +53,8 @@ class Constants(object):
     ACSM = "application/vnd.adobe.adept+xml"
     OPDS_ENTRY = "application/atom+xml;type=entry;profile=opds-catalog"
     AUDIOBOOK_JSON = "application/audiobook+json"
+    RBDIGITAL_ACCESS_DOCUMENT = "vnd.librarysimplified/rbdigital-access-document+json"
+    MPEG_AUDIO = "audio/mpeg"
 
     PROBLEM_DETAIL = "application/api-problem+json"
 
@@ -74,6 +76,10 @@ class MakesRequests(Constants):
             self._representation = response.content
         return self._representation
 
+    def head(self):
+        response = self.request(self.url, self.name, self.expect_content_type, method='HEAD')
+        return response
+
     def p(self, msg):
         print(msg.encode("utf8"))
 
@@ -83,17 +89,35 @@ class MakesRequests(Constants):
     def warn(self, warning):
         self.p("WARN: %s" % warning)
 
-    def request(self, url, name, expect_content_type):
-        response = requests.get(url, auth=self.auth)
+    def request(self, url, name, expect_content_type, method=None):
+        if method is None:
+            method = 'GET'
+        response = requests.request(method, url, auth=self.auth)
+        method = response.request.method
+        verbose = False if method == 'HEAD' else args.verbose
+
         self.p("Retrieved %s from %s" % (name, url))
 
         if response.status_code / 100 != 2:
             self.warn("Status code was %s." % response.status_code)
 
         content_type = response.headers.get('Content-Type')
+        content_length_reported = response.headers.get('Content-Length', '(none)')
+        content_length_actual = str(len(response.content)) if method != 'HEAD' else 'N/A'
+        self.p(" %s bytes (reported), %s bytes (actual), Content-Type: %s" % (
+            content_length_reported, content_length_actual, content_type
+        ))
+
         if content_type == self.PROBLEM_DETAIL:
+            problem_detail = response.content
+            # If this was a HEAD request, try to GET the actual problem detail. If
+            # we get something back that's not a problem detail, we'll ignore it.
+            if method == 'HEAD':
+                response = requests.get(url, auth=self.auth)
+                if response.headers.get('Content-Type') == self.PROBLEM_DETAIL:
+                    problem_detail = response.content
             self.warn(
-                "Got a problem detail document: %r" % response.content
+                "Got a problem detail document: %r" % problem_detail
             )
         if expect_content_type and (not content_type or not content_type.startswith(expect_content_type)):
             self.warn(
@@ -101,8 +125,8 @@ class MakesRequests(Constants):
                     expect_content_type, content_type
                 )
             )
-        self.p(" %d bytes, %s" % (len(response.content), content_type))
-        if args.verbose:
+
+        if verbose:
             self.p("-" * 80)
             content = response.content.decode("utf8")
             if 'xml' in content_type:
@@ -119,9 +143,11 @@ class Fulfillment(MakesRequests):
     REGISTRY = {}
 
     @classmethod
-    def fulfill(cls, url, name, type, auth):
+    def fulfill(cls, url, name, type, auth, expect_content_type=None):
+        # The expected type might not be the same as the type.
+        expect_content_type = expect_content_type or type
         fulfillment_class = cls.REGISTRY.get(type, Fulfillment)
-        fulfillment = fulfillment_class(url, name, auth, expect_content_type=type)
+        fulfillment = fulfillment_class(url, name, auth, expect_content_type=expect_content_type)
         fulfillment.validate()
 
     def validate(self):
@@ -150,6 +176,17 @@ class ACSMFulfillment(Fulfillment):
             )
 Fulfillment.register(ACSMFulfillment)
 
+
+class MPEGAudioFulfillment(Fulfillment):
+
+    MEDIA_TYPE = Constants.MPEG_AUDIO
+
+    def validate(self):
+        result = self.head()
+
+Fulfillment.register(MPEGAudioFulfillment)
+
+
 class AudiobookJSONFulfillment(Fulfillment):
     MEDIA_TYPE = Constants.AUDIOBOOK_JSON
 
@@ -167,13 +204,45 @@ class AudiobookJSONFulfillment(Fulfillment):
             self.p("Trying to fulfill first item.")
             type = item1.get('type', None)
 
+            expect_content_type = type
+
+            # Handle RBdigital access document
+            if type == Constants.RBDIGITAL_ACCESS_DOCUMENT:
+                expect_content_type = 'application/json; charset=utf-8'
+
             # Make a recursive call to Fulfillment.fulfill
             # NOTE: for now we are not passing along self.auth
             #  because the recursive call might go outside the CM.
             Fulfillment.fulfill(
-                item1['href'], "first audiobook item", type, auth=None
+                item1['href'], "first audiobook item", type, auth=None,
+                expect_content_type=expect_content_type
             )
+
 Fulfillment.register(AudiobookJSONFulfillment)
+
+class RBdigitalAccessDocument(Fulfillment):
+    MEDIA_TYPE = Constants.RBDIGITAL_ACCESS_DOCUMENT
+    MEDIA_TYPE_LABEL = 'RBdigital access document'
+
+    def validate(self):
+        result = self.get()
+        parsed = json.loads(result)
+        url = parsed.get('url', None)
+        type = parsed.get('type', None)
+        if not url:
+            self.error("'url' not present in {}".format(self.MEDIA_TYPE_LABEL))
+        if not 'type':
+            self.error("'type' not present in {}".format(self.MEDIA_TYPE_LABEL))
+
+        if url:
+            # Make a recursive call to Fulfillment.fulfill
+            # NOTE: for now we are not passing along self.auth
+            #  because the recursive call might go outside the CM.
+            Fulfillment.fulfill(
+                url, 'content of first audiobook part', type, auth=None,
+            )
+Fulfillment.register(RBdigitalAccessDocument)
+
 
 class PatronProfileDocument(MakesRequests):
 
