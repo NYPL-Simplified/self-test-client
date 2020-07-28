@@ -13,16 +13,20 @@ from bs4 import BeautifulSoup
 import requests
 from requests.auth import HTTPBasicAuth
 
+
 parser = argparse.ArgumentParser(
     description='Test the behavior of an OPDS server within the Library Simplified ecosystem'
 )
 parser.add_argument(
-    '--registry-url', help="URL to the library registry",
-    default = "https://libraryregistry.librarysimplified.org/libraries/qa"
+    '--registry-url', help="URL to the library registry"
 )
 parser.add_argument(
     '--library',
     help='Name of the library to test (as seen in the library registry)'
+)
+parser.add_argument(
+    '--opds-server',
+    help="An OPDS server endpoint URL. When specified, `--registry-url` and `--library` flags will be ignored."
 )
 parser.add_argument(
     '--username', help="Username to present to the OPDS server."
@@ -36,6 +40,7 @@ parser.add_argument(
     action="store_true", default=False
 )
 args = parser.parse_args()
+
 
 class Constants(object):
 
@@ -332,36 +337,55 @@ class LibraryRegistry(MakesRequests):
         return AuthenticationDocument(authentication_link)
 
 
-# We start by connecting to the library registry and locating the
-# requested library.
-registry = LibraryRegistry(args.registry_url)
+def main():
+    DEFAULT_REGISTRY_URL = "https://libraryregistry.librarysimplified.org/libraries/qa"
 
-# We then fetch that library's authentication document.
-authentication_document = registry.authentication_document(args.library)
-if not authentication_document:
-    print("Library not found: %s" % args.library)
-    print("Available libraries:")
-    for i in sorted(registry.libraries.keys()):
-        print((" " + i).encode("utf8"))
-    sys.exit()
+    # If we're given a library's OPDS server endpoint, we'll use that to get
+    # the authentication document and will ignore the `--registry-url` and
+    # `--library` flags. Otherwise, we'll use `--registry-url` and `--library`
+    # to find the authentication document.
+    if args.opds_server is not None:
+        if args.registry_url or args.library:
+            print("WARNING: `--opds-server` specified. Ignoring `--registry-url` and `--library` flags.")
+        opds_server = args.opds_server + '/' if not args.opds_server.endswith('/') else ''
+        authentication_document = AuthenticationDocument(opds_server + "authentication_document")
+    else:
+        # We start by connecting to the library registry and locating the
+        # requested library.
+        registry_url = args.registry_url or DEFAULT_REGISTRY_URL
+        registry = LibraryRegistry(registry_url)
 
-# At this point we need to start making authenticated requests.
-authentication_document.set_auth(args.username, args.password)
+        # We then fetch that library's authentication document.
+        authentication_document = registry.authentication_document(args.library)
+        if not authentication_document:
+            print("Library not found: %s" % args.library)
+            print("Available libraries:")
+            for i in sorted(registry.libraries.keys()):
+                print((" " + i).encode("utf8"))
+            sys.exit()
 
-# The authentication document links to the OPDS server's main catalog
-# and to the patron profile document
-patron_profile_document = authentication_document.patron_profile_document
-if patron_profile_document:
-    patron_profile_document.validate()
+    # At this point we need to start making authenticated requests.
+    authentication_document.set_auth(args.username, args.password)
 
-# It also links to the patron's bookshelf.
-bookshelf = authentication_document.bookshelf
-if bookshelf:
-    bookshelf.validate()
+    # The authentication document links to the OPDS server's main catalog
+    # and to the patron profile document
+    patron_profile_document = authentication_document.patron_profile_document
+    if patron_profile_document:
+        patron_profile_document.validate()
 
-# And it links to the main catalog.
-main_catalog = authentication_document.main_catalog
-if main_catalog:
-    main_catalog.validate()
+    # It also links to the patron's bookshelf.
+    bookshelf = authentication_document.bookshelf
+    if bookshelf:
+        bookshelf.validate()
+
+    # And it links to the main catalog.
+    main_catalog = authentication_document.main_catalog
+    if main_catalog:
+        main_catalog.validate()
 
 
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\nReceived keyboard interrupt. Ending.')
