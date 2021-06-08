@@ -4,40 +4,20 @@
 # pip install -r requirements.txt
 # python self-test.py --help
 
-import argparse
+import click
 from collections import defaultdict
 import json
+import re
 import sys
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 import requests
 from requests.auth import HTTPBasicAuth
 
-parser = argparse.ArgumentParser(
-    description='Test the behavior of an OPDS server within the Library Simplified ecosystem'
-)
-parser.add_argument(
-    '--registry-url', help="URL to the library registry",
-    default = "https://libraryregistry.librarysimplified.org/libraries/qa"
-)
-parser.add_argument(
-    '--library',
-    help='Name of the library to test (as seen in the library registry)'
-)
-parser.add_argument(
-    '--username', help="Username to present to the OPDS server."
-)
-parser.add_argument(
-    '--password', help="Password to present to the OPDS server.",
-    default=""
-)
-parser.add_argument(
-    '--verbose', help='Produce verbose output',
-    action="store_true", default=False
-)
-args = parser.parse_args()
-
 class Constants(object):
+
+    verbose = False
 
     # Constants for media types
     OPDS_1 = 'application/atom+xml;profile=opds-catalog;kind=acquisition'
@@ -70,13 +50,15 @@ class MakesRequests(Constants):
         return self._representation
 
     def p(self, msg):
-        print(msg.encode("utf8"))
+        click.echo(msg)
 
     def error(self, error):
-        self.p("ERROR: %s" % error)
+        click.echo(click.style("ERROR ", fg="red", bold=True), nl=False)
+        click.echo(error)
 
     def warn(self, warning):
-        self.p("WARN: %s" % warning)
+        click.echo(click.style("WARN ", fg="red", bold=False), nl=False)
+        click.echo(warning)
 
     def request(self, url, name, expect_content_type):
         response = requests.get(url, auth=self.auth)
@@ -97,14 +79,14 @@ class MakesRequests(Constants):
                 )
             )
         self.p(" %d bytes, %s" % (len(response.content), content_type))
-        if args.verbose:
+        if self.verbose:
             self.p("-" * 80)
             content = response.content.decode("utf8")
             if 'xml' in content_type:
                 content = BeautifulSoup(content, 'xml').prettify()
             elif 'json' in content_type:
                 content = json.dumps(json.loads(content), sort_keys=True, indent=4)
-        
+
             self.p(content)
             self.p("-" * 80)
         return response
@@ -175,7 +157,7 @@ class PatronProfileDocument(MakesRequests):
     NAME = "patron profile document"
     MEDIA_TYPE = Constants.PATRON_PROFILE_DOCUMENT
 
-    def validate(self):
+    def validate(self, registry):
         data = json.loads(self.get())
         adobe_credentials = False
         if 'drm' in data:
@@ -191,14 +173,16 @@ class PatronProfileDocument(MakesRequests):
                     break
         if adobe_credentials:
             self.p("Adobe token found: %s, %s" % (vendor, token))
+            registry.validate_short_client_token(token)
         else:
             self.warn("No Adobe token found.")
+
 
 class AuthenticationDocument(MakesRequests):
 
     NAME = "authentication document"
     MEDIA_TYPE = Constants.AUTHENTICATION_DOCUMENT
-    
+
     def __init__(self, url):
         super(AuthenticationDocument, self).__init__(url, None)
         self.data = json.loads(self.get())
@@ -304,10 +288,23 @@ class Bookshelf(OPDS1Feed):
             Fulfillment.fulfill(link['href'], name, type, self.auth)
 
 
+class InvalidShortClientTokenException(Exception):
+    ...
+
 class LibraryRegistry(MakesRequests):
 
     NAME = "library registry"
     MEDIA_TYPE = Constants.OPDS_2
+
+    CLIENT_TOKEN_RE = re.compile(r'''
+                                ^
+                                (?P<library>[^|]+) \|               # Any number of characters up to a pipe
+                                (?P<timestamp>[0-9]+) \|            # Epoch timestamp, any number of digits
+                                (?P<patron_id>[-A-Za-z0-9]{36}) \|  # The patron id is a UUID, 36 characters long
+                                (?P<signature_hash>.*)              # Everything after the third pipe
+                                $
+                             ''', re.IGNORECASE | re.VERBOSE)
+    REGISTRY_RESPONSE_RE = re.compile(r'''<user>(?P<user_id>[^<]+?)</user>''', re.IGNORECASE)
 
     def __init__(self, url):
         super(LibraryRegistry, self).__init__(url)
@@ -318,6 +315,11 @@ class LibraryRegistry(MakesRequests):
             self.libraries[l['metadata']['title']] = l
 
     def authentication_document(self, name):
+        if name.startswith("http"):
+            # This is probably the URL to the authentication document.
+            # Just return it; this allows us to test libraries not in the
+            # registry.
+            return AuthenticationDocument(name)
         if name not in self.libraries:
             return None
         authentication_link = None
@@ -331,37 +333,130 @@ class LibraryRegistry(MakesRequests):
             )
         return AuthenticationDocument(authentication_link)
 
+    def validate_short_client_token(self, token):
+        """
+        Retrieve an Adobe ID from a Short Client Token and validate it.
 
-# We start by connecting to the library registry and locating the
-# requested library.
-registry = LibraryRegistry(args.registry_url)
+        A short token is a four part, pipe-separated string which follows this pattern:
 
-# We then fetch that library's authentication document.
-authentication_document = registry.authentication_document(args.library)
-if not authentication_document:
-    print("Library not found: %s" % args.library)
-    print("Available libraries:")
-    for i in sorted(registry.libraries.keys()):
-        print((" " + i).encode("utf8"))
-    sys.exit()
+        \b
+        <library-code>|<epoch-timestamp>|<patron-id>|<signature-hash>
 
-# At this point we need to start making authenticated requests.
-authentication_document.set_auth(args.username, args.password)
+        Example:
 
-# The authentication document links to the OPDS server's main catalog
-# and to the patron profile document
-patron_profile_document = authentication_document.patron_profile_document
-if patron_profile_document:
-    patron_profile_document.validate()
+        \b
+        NYNYPL|1621462513|3e0d6602-2446-4f1a-bcad-4e68bcffdfc1|xzu4JDv93sjAEzx1sSIxyWrXn;zXD62;vsR:LT1y8M0@
 
-# It also links to the patron's bookshelf.
-bookshelf = authentication_document.bookshelf
-if bookshelf:
-    bookshelf.validate()
+        :param token: A string
+        :raise InvalidShortClientTokenException: If the token is invalid.
+        """
+        (library, timestamp, patron_id, signature_hash) = self.decompose_token(token)
 
-# And it links to the main catalog.
-main_catalog = authentication_document.main_catalog
-if main_catalog:
-    main_catalog.validate()
+        click.echo("\nThe supplied Short Client Token was well formed, and decomposes to:\n")
+        click.echo(f"  Library code:      {library}")
+        click.echo(f"  Timestamp:         {timestamp}")
+        click.echo(f"  Patron identifier: {patron_id}")
+        click.echo(f"  Signature:         {signature_hash}\n")
 
+        signin_url = urljoin(self.url, "/AdobeAuth/SignIn")
 
+        username = "|".join([library, timestamp, patron_id])
+
+        signin_payload_lines = [
+            '<signInRequest method="standard" xmlns="http://ns.adobe.com/adept">',
+            f"    <username>{username}</username>",
+            f"    <password>{signature_hash}</password>",
+            "</signInRequest>",
+        ]
+
+        click.echo(f"\nRequesting {signin_url}\n")
+        if self.verbose:
+            for line in signin_payload_lines:
+                click.echo(f"    {line}")
+
+        response = requests.post(signin_url, data="".join(signin_payload_lines))
+
+        if self.verbose:
+            click.echo("\nRegistry server responded with:\n")
+            for line in response.content.decode('utf8').split("\n"):
+                click.echo(f"    {line}")
+            click.echo()
+
+        user_id_match = self.REGISTRY_RESPONSE_RE.search(response.content.decode('utf8'))
+        if user_id_match:
+            click.echo(click.style("SUCCESS ", fg="green", bold=True), nl=False)
+            click.echo(f"Adobe ID for this patron is {user_id_match.group('user_id')}")
+            click.echo(click.style(" SUCCESS", fg="green", bold=True))
+        else:
+            click.echo(click.style("ERROR ", fg="red", bold=True), nl=False)
+            click.echo("Supplied token could not be turned into an Adobe ID", nl=False)
+            click.echo(click.style(" ERROR", fg="red", bold=True))
+
+    def decompose_token(self, token):
+        if "drm:clientToken" in token:
+            token = token.replace("<drm:clientToken>", "").replace("</drm:clientToken>", "")
+        m = self.CLIENT_TOKEN_RE.match(token)
+
+        if not m:
+            raise InvalidShortClientTokenException(f"Invalid token: {token}")
+        else:
+            return m.groups()   # Tuple of library, timestamp, patron_id, signature_hash
+
+@click.command()
+@click.option(
+    '--registry-url', help="URL to the library registry",
+    metavar="<URL>",
+    default = "https://libraryregistry.librarysimplified.org/libraries/qa"
+)
+@click.option(
+    '--library',
+    help='Name of the library to test (as seen in the library registry), or the URL to its authentication document'
+)
+@click.option(
+    '--username', help="Username to present to the OPDS server."
+)
+@click.option(
+    '--password', help="Password to present to the OPDS server.",
+    default=""
+)
+@click.option(
+    '--verbose', help='Produce verbose output',
+    is_flag=True, default=False
+)
+def main(registry_url, library, username, password, verbose):
+
+    Constants.verbose = verbose
+
+    # We start by connecting to the library registry and locating the
+    # requested library.
+    registry = LibraryRegistry(registry_url)
+
+    # We then fetch that library's authentication document.
+    authentication_document = registry.authentication_document(library)
+    if not authentication_document:
+        click.echo(f"Library not found: {library}")
+        click.echo("Available libraries:")
+        for i in sorted(registry.libraries.keys()):
+            click.echo(f" {i}")
+        sys.exit()
+
+    # At this point we need to start making authenticated requests.
+    authentication_document.set_auth(username, password)
+
+    # The authentication document links to the OPDS server's main catalog
+    # and to the patron profile document
+    patron_profile_document = authentication_document.patron_profile_document
+    if patron_profile_document:
+        patron_profile_document.validate(registry)
+
+    # It also links to the patron's bookshelf.
+    bookshelf = authentication_document.bookshelf
+    if bookshelf:
+        bookshelf.validate()
+
+    # And it links to the main catalog.
+    main_catalog = authentication_document.main_catalog
+    if main_catalog:
+        main_catalog.validate()
+
+main()
