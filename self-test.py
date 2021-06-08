@@ -381,7 +381,7 @@ class LibraryRegistry(MakesRequests):
         self.library_list = self.get()
         libraries = json.loads(self.library_list)
         self.libraries = {}
-        for l in libraries['catalogs']:
+        for l in libraries.get('catalogs', []):
             self.libraries[l['metadata']['title']] = l
 
     def authentication_document(self, name):
