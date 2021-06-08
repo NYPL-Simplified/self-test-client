@@ -5,6 +5,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 global verbose
+verbose = False
 
 class Constants(object):
 
@@ -19,6 +20,20 @@ class Constants(object):
     AUDIOBOOK_JSON = "application/audiobook+json"
 
     PROBLEM_DETAIL = "application/api-problem+json"
+
+    # Constants for authentication types
+    BASIC_AUTH = "http://opds-spec.org/auth/basic"
+    OAUTH_WITH_INTERMEDIARY = "http://librarysimplified.org/authtype/OAuth-with-intermediary"
+
+    def p(self, msg):
+        print(msg)
+
+    def error(self, error):
+        self.p("ERROR: %s" % error)
+
+    def warn(self, warning):
+        self.p("WARN: %s" % warning)
+
 
 class MakesRequests(Constants):
 
@@ -37,15 +52,6 @@ class MakesRequests(Constants):
             response = self.request(self.url, self.name, self.expect_content_type)
             self._representation = response.content
         return self._representation
-
-    def p(self, msg):
-        print(msg)
-
-    def error(self, error):
-        self.p("ERROR: %s" % error)
-
-    def warn(self, warning):
-        self.p("WARN: %s" % warning)
 
     def request(self, url, name, expect_content_type):
         response = requests.get(url, auth=self.auth)
@@ -164,7 +170,23 @@ class PatronProfileDocument(MakesRequests):
         else:
             self.warn("No Adobe token found.")
 
-class AuthenticationDocument(MakesRequests):
+class HasLinks(Constants):
+
+    def link_with_rel(self, rel):
+        links = [
+            x['href'] for x in self.data['links']
+            if x.get('rel') == rel
+        ]
+        if not links:
+            self.error(
+                'No link found with rel="%s"!' % rel
+            )
+        if links:
+            return links[0]
+        return None
+
+
+class AuthenticationDocument(MakesRequests, HasLinks):
 
     NAME = "authentication document"
     MEDIA_TYPE = Constants.AUTHENTICATION_DOCUMENT
@@ -189,18 +211,11 @@ class AuthenticationDocument(MakesRequests):
             )
         return OPDS1Feed(links[0], "main catalog", self.auth)
 
-    def link_with_rel(self, rel):
-        links = [
-            x['href'] for x in self.data['links']
-            if x.get('rel') == rel
-        ]
-        if not links:
-            self.error(
-                'Authentication document has no link with rel="%s"!' % rel
-            )
-        if links:
-            return links[0]
-        return None
+    def authentication_mechanisms(self, type=None):
+        """Find authentication mechanisms that match the given type."""
+        for mechanism in self.data.get('authentication', []):
+            if not type or mechanism.get('type') == type:
+                yield AuthenticationMechanism(mechanism)
 
     @property
     def patron_profile_document(self):
@@ -217,6 +232,12 @@ class AuthenticationDocument(MakesRequests):
         if not url:
             return None
         return Bookshelf(url, "bookshelf", self.auth)
+
+
+class AuthenticationMechanism(HasLinks):
+    def __init__(self, data):
+        self.data = data
+
 
 class OPDS1Feed(MakesRequests):
     def get(self):
