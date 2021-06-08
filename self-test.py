@@ -385,6 +385,8 @@ class LibraryRegistry(MakesRequests):
             self.libraries[l['metadata']['title']] = l
 
     def authentication_document(self, name):
+        if not name:
+            return None
         if name.startswith("http"):
             # This is probably the URL to the authentication document.
             # Just return it; this allows us to test libraries not in the
